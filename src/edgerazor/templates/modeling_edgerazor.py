@@ -34,6 +34,16 @@ class EdgeRazorForCausalLM:
     """
 
     @classmethod
+    def register_for_auto_class(cls, auto_class="AutoModel"):
+        """Compatibility shim for newer transformers.
+
+        ``AutoModelForCausalLM.from_pretrained`` calls this on classes resolved
+        via ``auto_map``. ``EdgeRazorForCausalLM`` is a loader dispatcher (not a
+        real ``PreTrainedModel`` subclass), so this is a no-op.
+        """
+        pass
+
+    @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         # Pop trust_remote_code — the user passed it to enable auto_map, but
         # all internal calls use trust_remote_code=False to avoid recursion.
