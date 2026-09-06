@@ -278,6 +278,43 @@ a8kv8 = create_quant_config(
     target_types=[], kv_block_size=64,
 )
 
+# "norm" configs: full QAT from FP16 weights (is_w_quantized=True), decoder-only
+# linear layers (exclude lm_head), activation + KV in INT8, all block sizes 256.
+w1_58a8kv8_norm = create_quant_config(
+    mp_prop=0.00,
+    w_scale_factor=2.0,
+    with_activation_kv=True,
+    is_w_quantized=True,
+    target_types=["linear"],
+    exclude_names=["lm_head"],
+    kv_block_size=256,
+)
+w1_88a8kv8_norm = create_quant_config(
+    mp_prop=0.125,
+    w_scale_factor=2.0,
+    with_activation_kv=True,
+    is_w_quantized=True,
+    target_types=["linear"],
+    exclude_names=["lm_head"],
+    kv_block_size=256,
+)
+w2_79a8kv8_norm = create_quant_config(
+    mp_prop=0.50,
+    w_scale_factor=2.0,
+    with_activation_kv=True,
+    is_w_quantized=True,
+    target_types=["linear"],
+    exclude_names=["lm_head"],
+    kv_block_size=256,
+)
+w4a8kv8_norm = create_quant_config(
+    w_func=_W4_ABSMAX,
+    with_activation_kv=True,
+    is_w_quantized=True,
+    target_types=["linear"],
+    exclude_names=["lm_head"],
+    kv_block_size=256,
+)
 
 # Map quant_mode string to imported config dict
 quant_config_map = {
@@ -293,6 +330,10 @@ quant_config_map = {
     "w1_58a8kv8_embint4": w1_58a8kv8_embint4,
     "w1_58a8": w1_58a8,
     "w1_58a8kv16": w1_58a8kv16,
+    "w4a8kv8_norm": w4a8kv8_norm,
+    "w2_79a8kv8_norm": w2_79a8kv8_norm,
+    "w1_88a8kv8_norm": w1_88a8kv8_norm,
+    "w1_58a8kv8_norm": w1_58a8kv8_norm,
     "a8kv8": a8kv8,
 
     # ── Legacy model-specific configs (backward compatible) ──
