@@ -21,6 +21,7 @@ from .util.quant_function import (
     weight_quant_uniform_asymmetric_max_per_channel_int4,
     weight_quant_uniform_asymmetric_max_per_tensor_int4,
     weight_quant_uniform_symmetric_absmax_per_block_int1_58,
+    weight_quant_uniform_symmetric_absmax_per_block_int2,
     weight_quant_uniform_symmetric_absmax_per_block_int4,
     weight_quant_uniform_symmetric_absmax_per_block_int5,
     weight_quant_uniform_symmetric_absmax_per_block_int8,
@@ -49,6 +50,8 @@ _quant_functions = [
     weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_row_wise_sparse,
     weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static,
     weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_sparse,
+    # INT2 Weight Quantization - Absmax Method
+    weight_quant_uniform_symmetric_absmax_per_block_int2,
     # INT1_58 (Ternary) Weight Quantization - Absmax Method
     weight_quant_uniform_symmetric_absmax_per_tensor_int1_58,
     weight_quant_uniform_symmetric_absmax_per_channel_int1_58,

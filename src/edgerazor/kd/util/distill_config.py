@@ -43,6 +43,7 @@ class LossConfig:
     padding_id: int = -100  # also known as ignore_index
     confidence_k: int = 5
     is_router_logits: bool = False
+    is_confidence_per_token: bool = False  # Whether to compute confidence per token (for kldc)
     
     # General parameters
     reduction: str = "batch_mean"  # sum, mean, batch_mean, none

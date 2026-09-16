@@ -410,6 +410,49 @@ def weight_quant_uniform_symmetric_clip_per_block_mp_int1_58_int4_static_sparse(
 
 
 # =============================================================
+# INT2 Weight Quantization - Absmax Method
+# =============================================================
+
+
+@per_block_reshape
+def weight_quant_uniform_symmetric_absmax_per_block_int2(
+    w: Tensor,
+    epsilon: float = 1e-5,
+    block_size: int = w2a8_block_size,
+) -> Tensor:
+    """
+    Quantize weight to INT2 per-block using absmax method.
+
+    Quantizes weight to INT2: {-2, -1, 0, 1} * w_scale.
+    Scale factor is computed per block within each output channel using max(|w|).
+
+    Args:
+        w: Weight tensor to quantize, shape (out_dim, in_dim)
+        epsilon: Small value to prevent division by zero
+        block_size: Size of each quantization block
+
+    Returns:
+        Quantized weight tensor with values in {-2, -1, 0, 1} * w_scale
+    """
+    bits = 2
+    max_val = 2**(bits - 1) - 1  # 1 for INT2 (largest positive level)
+    min_val = -max_val - 1       # -2 for INT2 (smallest level)
+
+    with torch.no_grad():
+        # Compute scale factor for each block using absmax
+        # Shape: (out_dim, block_num, 1)
+        # max(|w|) maps to the largest magnitude level |min_val| = 2
+        w_scale = w.abs().max(dim=-1, keepdim=True).values.clamp_(min=epsilon) / (max_val + 1)
+
+        # Quantize to INT2: {-2, -1, 0, 1}
+        w_quant = w.div(w_scale).round_().clamp_(min_val, max_val)
+
+        w_quant = w_quant * w_scale
+
+    return w_quant
+
+
+# =============================================================
 # INT1_58 (Ternary) Weight Quantization - Absmax Method
 # =============================================================
 

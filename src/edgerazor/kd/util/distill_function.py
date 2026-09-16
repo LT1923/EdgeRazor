@@ -1,5 +1,7 @@
 # ruff: noqa: N812
 
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 
@@ -302,6 +304,108 @@ def compute_teacher_confidence(
     return torch.clamp(gamma, min=0.0, max=1.0)
 
 
+def compute_teacher_confidence_per_token(
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor | None,
+    kd_config_loss: LossConfig,
+) -> torch.Tensor:
+    """Compute per-token teacher confidence gamma (for ``is_confidence_per_token``).
+
+    Returns a per-position gamma with the same shape as the per-position entropy:
+    - logits [B, S, V]     -> [B, S]
+    - attention [B, H, S, S] -> [B, H, S]
+
+    Entropy method (``use_entropy=True``):  gamma = 1 - min(H(P), log(k)) / log(k)
+    Label method (``use_entropy=False``):    gamma = P_T(y_i) per position (logits only).
+    """
+    padding_id = kd_config_loss.padding_id
+    is_router_logits = kd_config_loss.is_router_logits
+    use_entropy = kd_config_loss.use_entropy
+    k = kd_config_loss.confidence_k
+
+    teacher_probs = F.softmax(teacher_logits, dim=-1)
+
+    # padding mask: logits -> [B, S]; attention -> broadcast to [B, H, S]
+    pad_mask = None
+    if labels is not None:
+        if not is_router_logits:
+            pad_mask = labels.eq(padding_id)
+        else:
+            pad_mask = labels.view(1, -1).eq(padding_id)
+
+    if use_entropy:
+        entropy = -torch.sum(teacher_probs * torch.log(teacher_probs + 1e-8), dim=-1)
+        max_entropy = torch.log(torch.tensor(k, dtype=torch.float, device=teacher_logits.device))
+        gamma = 1.0 - torch.clamp(entropy / max_entropy, min=0.0, max=1.0)
+    else:
+        if labels is None:
+            gamma = torch.full_like(teacher_probs[..., 0], 0.5)
+        else:
+            safe_labels = labels.clone()
+            safe_labels[pad_mask] = 0  # avoid invalid gather index on padding
+            target_probs = torch.gather(
+                teacher_probs, dim=-1, index=safe_labels.unsqueeze(-1)
+            ).squeeze(-1)  # [B, S]
+            gamma = target_probs
+
+    if pad_mask is not None:
+        while pad_mask.dim() < gamma.dim():
+            pad_mask = pad_mask.unsqueeze(1)
+        gamma = gamma.masked_fill(pad_mask, 0.0)
+
+    return torch.clamp(gamma, min=0.0, max=1.0)
+
+
+def _reduce_per_token(
+    per_token: torch.Tensor,
+    labels: torch.Tensor | None,
+    kd_config_loss: LossConfig,
+    is_attention: bool,
+) -> torch.Tensor:
+    """Reduce a per-token [B, S] (or [B, H, S]) loss with padding mask.
+
+    Mirrors the reduction logic in ``compute_kld`` so the per-token CAKLD path
+    produces the same scalar semantics as the scalar-gamma path.
+    """
+    padding_id = kd_config_loss.padding_id
+    is_router_logits = kd_config_loss.is_router_logits
+    reduction = kd_config_loss.reduction
+
+    if labels is not None:
+        if not is_router_logits:
+            if not is_attention:
+                pad_mask = labels.eq(padding_id)
+            else:
+                pad_mask = labels.eq(padding_id).unsqueeze(1)
+        else:
+            pad_mask = labels.view(1, -1).eq(padding_id)
+        valid_elements = (~pad_mask).sum(dim=-1)
+
+        if reduction == "sum":
+            return per_token.masked_fill(pad_mask, 0.0).sum()
+        elif reduction == "mean":
+            kl_sum = per_token.masked_fill(pad_mask, 0.0).sum()
+            non_pad_total = valid_elements.sum().clamp(min=1)
+            return kl_sum / non_pad_total
+        elif reduction == "batch_mean":
+            kl_per_sample = per_token.masked_fill(pad_mask, 0.0).sum(dim=-1)
+            kl_per_sample = kl_per_sample / valid_elements.clamp(min=1)
+            return kl_per_sample.mean()
+        elif reduction == "none":
+            return per_token.masked_fill(pad_mask, 0.0)
+        else:
+            raise ValueError(f"Unsupported reduction mode: {reduction}")
+    else:
+        if reduction == "sum":
+            return per_token.sum()
+        elif reduction in ("mean", "batch_mean"):
+            return per_token.mean()
+        elif reduction == "none":
+            return per_token
+        else:
+            raise ValueError(f"Unsupported reduction mode: {reduction}")
+
+
 def compute_kld_confidence(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
@@ -313,7 +417,10 @@ def compute_kld_confidence(
     "BitDistiller: Unleashing the Potential of Sub-4-Bit LLMs via Self-Distillation"
 
     CAKLD = γ*Reverse_KL(student || teacher) + (1-γ)*Forward_KL(teacher || student)
-    where γ = E_{(x,y)~D}[1/|{y}| ∑_{i=1}^{|y|} P_T(y_i | x, y_{<i})]
+
+    By default γ is a single scalar (teacher's average confidence over the batch).
+    When ``LossConfig.is_confidence_per_token=True``, γ becomes a per-token tensor
+    and each position is weighted by its own teacher confidence before reduction.
 
     Args:
         student_logits: Student model logits [batch_size, seq_len, vocab_size]
@@ -321,39 +428,52 @@ def compute_kld_confidence(
         labels: Target labels [batch_size, seq_len]. If None (e.g., ViT models), no masking is applied.
         kd_config_loss: LossConfig object containing all KLD-related parameters
     """
-    # 1. Compute γ (teacher's average token probability / confidence coefficient)
-    # When teacher confidence is high (γ ≈ 1):
-    #   Favor KL(student || teacher) - force student to imitate teacher (mode covering)
-    # When teacher confidence is low (γ ≈ 0):
-    #   Favor KL(teacher || student) - allow student to make its own decisions (mode seeking)
-    gamma = compute_teacher_confidence(
-        teacher_logits=teacher_logits, labels=labels, kd_config_loss=kd_config_loss
-    )
+    if not kd_config_loss.is_confidence_per_token:
+        # --- scalar gamma (original CAKLD) ---
+        gamma = compute_teacher_confidence(
+            teacher_logits=teacher_logits, labels=labels, kd_config_loss=kd_config_loss
+        )
+        reverse_kl = compute_kld_reverse(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            labels=labels,
+            kd_config_loss=kd_config_loss,
+        )
+        forward_kl = compute_kld_forward(
+            student_logits=student_logits,
+            teacher_logits=teacher_logits,
+            labels=labels,
+            kd_config_loss=kd_config_loss,
+        )
+        return gamma * reverse_kl + (1 - gamma) * forward_kl
 
-    # 2. Compute Reverse KL: KL(student || teacher)
+    # --- per-token gamma ---
+    is_attention = student_logits.dim() == 4
+    gamma = compute_teacher_confidence_per_token(
+        teacher_logits=teacher_logits, labels=labels, kd_config_loss=kd_config_loss
+    )  # [B, S] or [B, H, S]
+
+    none_cfg = replace(kd_config_loss, reduction="none")
     reverse_kl = compute_kld_reverse(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
         labels=labels,
-        kd_config_loss=kd_config_loss,
-    )
-
-    # 3. Compute Forward KL: KL(teacher || student)
+        kd_config_loss=none_cfg,
+    )  # [B, S] or [B, H, S]
     forward_kl = compute_kld_forward(
         student_logits=student_logits,
         teacher_logits=teacher_logits,
         labels=labels,
+        kd_config_loss=none_cfg,
+    )  # [B, S] or [B, H, S]
+
+    cakld_per_token = gamma * reverse_kl + (1 - gamma) * forward_kl
+    return _reduce_per_token(
+        per_token=cakld_per_token,
+        labels=labels,
         kd_config_loss=kd_config_loss,
+        is_attention=is_attention,
     )
-
-    # 4. Compute weighted CAKLD
-    cakld = gamma * reverse_kl + (1 - gamma) * forward_kl
-
-    # # LOG
-    # print(f"gamma={gamma}, kld_r={reverse_kl}, kld_f={forward_kl}")
-    # print(f"cakld={cakld}")
-
-    return cakld
 
 
 # ========================================= State Distillation: MSE =========================================
